@@ -5,47 +5,47 @@ import { logger } from "../logger.js";
 
 const API_BASE = "https://api.anthropic.com/v1";
 const BETA_HEADER = "managed-agents-2026-04-01";
+const SESSION_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes
 
 let agentId: string;
 let environmentId: string;
 
 // ── Low-level API helpers ────────────────────────────────────────────────────
 
-async function apiCall<T>(path: string, body: Record<string, unknown>): Promise<T> {
+function apiHeaders(): Record<string, string> {
   const config = getConfig();
+  return {
+    "Content-Type": "application/json",
+    "x-api-key": config.ANTHROPIC_API_KEY,
+    "anthropic-version": "2023-06-01",
+    "anthropic-beta": BETA_HEADER,
+  };
+}
+
+async function apiPost<T>(path: string, body: Record<string, unknown>): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": config.ANTHROPIC_API_KEY,
-      "anthropic-version": "2023-06-01",
-      "anthropic-beta": BETA_HEADER,
-    },
+    headers: apiHeaders(),
     body: JSON.stringify(body),
   });
 
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    throw new Error(`Anthropic API error ${res.status}: ${text}`);
+    throw new Error(`Anthropic API error ${res.status} on POST ${path}: ${text}`);
   }
 
   return res.json() as Promise<T>;
 }
 
 async function apiGet<T>(path: string): Promise<T> {
-  const config = getConfig();
   const res = await fetch(`${API_BASE}${path}`, {
     method: "GET",
-    headers: {
-      "x-api-key": config.ANTHROPIC_API_KEY,
-      "anthropic-version": "2023-06-01",
-      "anthropic-beta": BETA_HEADER,
-    },
+    headers: apiHeaders(),
   });
 
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    throw new Error(`Anthropic API error ${res.status}: ${text}`);
+    throw new Error(`Anthropic API error ${res.status} on GET ${path}: ${text}`);
   }
 
   return res.json() as Promise<T>;
@@ -60,23 +60,25 @@ async function apiGet<T>(path: string): Promise<T> {
 export async function initializeAgent(): Promise<void> {
   logger.info("Creating Managed Agent...");
 
-  const agent = await apiCall<{ id: string }>("/agents", {
+  const agent = await apiPost<{ id: string }>("/agents", {
     name: "Business Function Generator",
     model: "claude-opus-4-6",
     system: SYSTEM_PROMPT,
-    tools: [{ type: "agent_toolset_20260401", default_config: { enabled: true } }],
-    max_tokens: 16384,
+    tools: [{ type: "agent_toolset_20260401" }],
   });
   agentId = agent.id;
   logger.info({ agentId }, "Managed Agent created");
 
   logger.info("Creating Environment...");
-  const environment = await apiCall<{ id: string }>("/environments", {
-    name: "bf-generator-env",
-    packages: {
-      npm: ["hono", "@hono/node-server", "pdf-lib", "typescript", "esbuild", "tsx", "@types/node"],
+  const environment = await apiPost<{ id: string }>("/environments", {
+    name: `bf-generator-env-${Date.now()}`,
+    config: {
+      type: "cloud",
+      packages: {
+        npm: ["hono", "@hono/node-server", "pdf-lib", "typescript", "esbuild", "tsx", "@types/node"],
+      },
+      networking: { type: "unrestricted" },
     },
-    networking: { mode: "unrestricted" },
   });
   environmentId = environment.id;
   logger.info({ environmentId }, "Environment created");
@@ -85,18 +87,19 @@ export async function initializeAgent(): Promise<void> {
 // ── Session management ───────────────────────────────────────────────────────
 
 /**
- * Generate a business function by creating a session and streaming until completion.
- * The agent generates code, validates locally, pushes to GitHub, deploys to Railway.
+ * Generate a business function by creating a session, sending the task,
+ * and streaming events until the agent reaches idle state.
  */
 export async function generateBusinessFunction(params: GenerateRequest): Promise<SessionResult> {
   const config = getConfig();
 
   logger.info({ slug: params.slug, orgId: params.orgId }, "Starting business function generation");
 
-  // Create a new session
-  const session = await apiCall<{ id: string }>("/sessions", {
-    agent_id: agentId,
+  // Create a new session referencing agent + environment
+  const session = await apiPost<{ id: string }>("/sessions", {
+    agent: agentId,
     environment_id: environmentId,
+    title: `Generate BF: ${params.slug}`,
   });
   logger.info({ sessionId: session.id }, "Session created");
 
@@ -112,8 +115,8 @@ export async function generateBusinessFunction(params: GenerateRequest): Promise
     githubToken: config.GITHUB_TOKEN,
   });
 
-  // Send the task and wait for completion
-  const result = await sendAndWaitForCompletion(session.id, userPrompt);
+  // Send the task and stream until idle
+  const result = await sendAndStreamToCompletion(session.id, userPrompt);
   return { ...result, sessionId: session.id };
 }
 
@@ -133,141 +136,110 @@ export async function retryInSession(sessionId: string, errors: string[]): Promi
     "After fixing, output the JSON result on the last line as before.",
   ].join("\n");
 
-  const result = await sendAndWaitForCompletion(sessionId, message);
+  const result = await sendAndStreamToCompletion(sessionId, message);
   return { ...result, sessionId };
 }
 
-// ── Core: send message and stream events ─────────────────────────────────────
+// ── Core: send message via events API, then stream SSE until idle ─────────
 
-async function sendAndWaitForCompletion(
+async function sendAndStreamToCompletion(
   sessionId: string,
   message: string,
 ): Promise<Omit<SessionResult, "sessionId">> {
   const config = getConfig();
 
-  // Send user message to the session
-  await apiCall(`/sessions/${sessionId}/messages`, {
-    role: "user",
-    content: message,
-  });
-
-  // Poll or stream for session completion
-  // The Managed Agents API uses SSE streaming for session events
+  // 1. Open SSE stream first (per docs recommendation)
   const streamUrl = `${API_BASE}/sessions/${sessionId}/stream`;
-  const res = await fetch(streamUrl, {
+  const streamRes = await fetch(streamUrl, {
     method: "GET",
     headers: {
-      "x-api-key": config.ANTHROPIC_API_KEY,
-      "anthropic-version": "2023-06-01",
-      "anthropic-beta": BETA_HEADER,
+      ...apiHeaders(),
       "Accept": "text/event-stream",
     },
-    signal: AbortSignal.timeout(15 * 60 * 1000), // 15 minute timeout
+    signal: AbortSignal.timeout(SESSION_TIMEOUT_MS),
   });
 
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`Stream error ${res.status}: ${text}`);
+  if (!streamRes.ok) {
+    const text = await streamRes.text().catch(() => "");
+    throw new Error(`Stream error ${streamRes.status}: ${text}`);
   }
 
-  // Read SSE stream
+  // 2. Send user message via events endpoint
+  await apiPost(`/sessions/${sessionId}/events`, {
+    events: [
+      {
+        type: "user.message",
+        content: [{ type: "text", text: message }],
+      },
+    ],
+  });
+  logger.info({ sessionId }, "User message sent");
+
+  // 3. Read SSE stream until session.status_idle or session.status_terminated
   let fullText = "";
-  const reader = res.body?.getReader();
+  const reader = streamRes.body?.getReader();
   if (!reader) throw new Error("No response body for SSE stream");
 
   const decoder = new TextDecoder();
   let buffer = "";
+  let sessionDone = false;
 
-  while (true) {
+  while (!sessionDone) {
     const { done, value } = await reader.read();
     if (done) break;
 
     buffer += decoder.decode(value, { stream: true });
 
-    // Parse SSE events from buffer
-    const lines = buffer.split("\n");
-    buffer = lines.pop() ?? ""; // Keep incomplete line in buffer
+    // Parse SSE events — split by double newline (event boundary)
+    const parts = buffer.split("\n");
+    buffer = parts.pop() ?? "";
 
-    for (const line of lines) {
-      if (line.startsWith("data: ")) {
-        const data = line.slice(6);
-        if (data === "[DONE]") continue;
+    for (const line of parts) {
+      if (!line.startsWith("data: ")) continue;
+      const data = line.slice(6).trim();
+      if (!data || data === "[DONE]") continue;
 
-        try {
-          const event = JSON.parse(data) as {
-            type: string;
-            delta?: { type?: string; text?: string };
-            error?: { message?: string };
-          };
-
-          if (event.type === "content_block_delta" && event.delta?.type === "text_delta" && event.delta.text) {
-            fullText += event.delta.text;
-          }
-          if (event.type === "error") {
-            throw new Error(`Agent session error: ${event.error?.message ?? JSON.stringify(event)}`);
-          }
-        } catch (e) {
-          if (e instanceof SyntaxError) continue; // Ignore malformed JSON
-          throw e;
-        }
-      }
-    }
-  }
-
-  // If streaming didn't capture text, try polling the session result
-  if (!fullText) {
-    logger.warn({ sessionId }, "No text captured from stream, polling session...");
-    const sessionState = await apiGet<{
-      status: string;
-      messages?: Array<{ role: string; content: string | Array<{ type: string; text?: string }> }>;
-    }>(`/sessions/${sessionId}`);
-
-    // Extract text from the last assistant message
-    const assistantMessages = sessionState.messages?.filter((m) => m.role === "assistant") ?? [];
-    for (const msg of assistantMessages.reverse()) {
-      if (typeof msg.content === "string") {
-        fullText = msg.content;
-        break;
-      }
-      if (Array.isArray(msg.content)) {
-        const textBlock = msg.content.find((b) => b.type === "text" && b.text);
-        if (textBlock?.text) {
-          fullText = textBlock.text;
-          break;
-        }
-      }
-    }
-  }
-
-  if (!fullText) {
-    throw new Error("Agent completed but produced no text output");
-  }
-
-  // Extract the JSON result from the last line
-  return extractJsonResult(fullText, sessionId);
-}
-
-function extractJsonResult(text: string, sessionId: string): Omit<SessionResult, "sessionId"> {
-  const lines = text.trim().split("\n");
-
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const line = lines[i]!.trim();
-    if (line.startsWith("{") && line.includes('"status"')) {
       try {
-        const result = JSON.parse(line) as {
-          status: string;
-          url?: string;
-          apiKey?: string;
-          repoUrl?: string;
-          message?: string;
+        const event = JSON.parse(data) as {
+          type: string;
+          content?: Array<{ type: string; text?: string }>;
+          stop_reason?: string;
+          error?: { message?: string };
         };
 
-        if (result.status === "ok" && result.url && result.apiKey && result.repoUrl) {
-          logger.info({ url: result.url, repoUrl: result.repoUrl }, "Agent returned valid result");
-          return { url: result.url, apiKey: result.apiKey, repoUrl: result.repoUrl };
-        }
-        if (result.status === "error") {
-          throw new Error(`Agent reported error: ${result.message ?? "unknown"}`);
+        switch (event.type) {
+          case "agent.message":
+            // Extract text from content blocks
+            if (event.content) {
+              for (const block of event.content) {
+                if (block.type === "text" && block.text) {
+                  fullText += block.text;
+                }
+              }
+            }
+            break;
+
+          case "session.status_idle":
+            logger.info({ sessionId, stopReason: event.stop_reason }, "Session reached idle");
+            sessionDone = true;
+            break;
+
+          case "session.status_terminated":
+            logger.error({ sessionId, event }, "Session terminated");
+            throw new Error(`Session terminated: ${event.error?.message ?? "unknown reason"}`);
+
+          case "session.error":
+            logger.error({ sessionId, error: event.error }, "Session error");
+            throw new Error(`Session error: ${event.error?.message ?? JSON.stringify(event)}`);
+
+          case "agent.tool_use":
+          case "agent.tool_result":
+            // Built-in tools executing — just log progress
+            break;
+
+          default:
+            // Ignore other event types (thinking, span, etc.)
+            break;
         }
       } catch (e) {
         if (e instanceof SyntaxError) continue;
@@ -276,6 +248,88 @@ function extractJsonResult(text: string, sessionId: string): Omit<SessionResult,
     }
   }
 
-  logger.error({ sessionId, outputLength: text.length, lastChars: text.slice(-500) }, "No valid JSON result found");
-  throw new Error("Agent completed but did not return a valid JSON result");
+  // Close the reader
+  reader.cancel().catch(() => {});
+
+  // If no text captured from stream, poll session for messages
+  if (!fullText) {
+    logger.warn({ sessionId }, "No text from stream, polling session...");
+    fullText = await pollSessionText(sessionId);
+  }
+
+  if (!fullText) {
+    throw new Error("Agent completed but produced no text output");
+  }
+
+  return extractJsonResult(fullText, sessionId);
+}
+
+/**
+ * Poll the session endpoint to get the last assistant message text.
+ * Fallback when SSE streaming doesn't capture text (e.g. events missed).
+ */
+async function pollSessionText(sessionId: string): Promise<string> {
+  const session = await apiGet<{
+    status: string;
+    messages?: Array<{
+      role: string;
+      content: string | Array<{ type: string; text?: string }>;
+    }>;
+  }>(`/sessions/${sessionId}`);
+
+  const assistantMsgs = session.messages?.filter((m) => m.role === "assistant") ?? [];
+
+  for (const msg of assistantMsgs.reverse()) {
+    if (typeof msg.content === "string") return msg.content;
+    if (Array.isArray(msg.content)) {
+      const texts = msg.content
+        .filter((b) => b.type === "text" && b.text)
+        .map((b) => b.text!)
+        .join("\n");
+      if (texts) return texts;
+    }
+  }
+
+  return "";
+}
+
+/**
+ * Extract the JSON result line from the agent's output.
+ * The system prompt instructs the agent to output a JSON object on the last line.
+ */
+function extractJsonResult(text: string, sessionId: string): Omit<SessionResult, "sessionId"> {
+  const lines = text.trim().split("\n");
+
+  // Search from the end for the JSON result
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]!.trim();
+    if (!line.startsWith("{")) continue;
+
+    try {
+      const result = JSON.parse(line) as {
+        status: string;
+        url?: string;
+        apiKey?: string;
+        repoUrl?: string;
+        message?: string;
+      };
+
+      if (result.status === "ok" && result.url && result.apiKey && result.repoUrl) {
+        logger.info({ url: result.url, repoUrl: result.repoUrl }, "Agent returned valid result");
+        return { url: result.url, apiKey: result.apiKey, repoUrl: result.repoUrl };
+      }
+      if (result.status === "error") {
+        throw new Error(`Agent reported error: ${result.message ?? "unknown"}`);
+      }
+    } catch (e) {
+      if (e instanceof SyntaxError) continue;
+      throw e;
+    }
+  }
+
+  logger.error(
+    { sessionId, outputLength: text.length, lastChars: text.slice(-500) },
+    "No valid JSON result found in agent output",
+  );
+  throw new Error("Agent completed but did not return a valid JSON result. Check session logs.");
 }
