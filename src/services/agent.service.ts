@@ -64,15 +64,7 @@ export async function initializeAgent(): Promise<void> {
     name: "Business Function Generator",
     model: "claude-opus-4-6",
     system: SYSTEM_PROMPT,
-    tools: [
-      { type: "bash" },
-      { type: "file_read" },
-      { type: "file_write" },
-      { type: "file_edit" },
-      { type: "glob" },
-      { type: "grep" },
-      { type: "web_fetch" },
-    ],
+    tools: [{ type: "agent_toolset_20260401", default_config: { enabled: true } }],
     max_tokens: 16384,
   });
   agentId = agent.id;
